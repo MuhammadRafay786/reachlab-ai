@@ -1,169 +1,321 @@
-"""ReachLab AI — Streamlit Community Cloud friendly episode finder MVP."""
+"""ReachLab AI — Cloud-ready Episode Finder; OpenAI fast + verify + Gemini fallback."""
+from __future__ import annotations
+
+import hashlib
 import hmac
+import io
 import os
 import time
 from urllib.parse import quote
 
 import streamlit as st
-from reachlab import (format_download, gemini_analyze, normalize_url,
-                      public_media_metadata, safe_string, tvmaze_verify)
 
-st.set_page_config(page_title="ReachLab AI | Find the Episode", page_icon="🎬", layout="centered")
+from media_utils import extract_video_frames_and_audio, transcribe_audio, youtube_public_evidence
+from openai_backend import FAST_MODEL, VERIFY_MODEL, analyze_openai, research_openai
+from reachlab import (
+    episode_match_status, format_download, gemini_analyze, grounded_web_research,
+    is_youtube, normalize_url, public_media_metadata, safe_string, tvmaze_verify,
+)
+
+st.set_page_config(page_title="ReachLab AI | Episode Finder", page_icon="🎬", layout="centered")
 st.markdown("""<style>
-.block-container {max-width: 920px; padding-top: 1.75rem; padding-bottom:3rem;}
-[data-testid="stApp"]{background: radial-gradient(ellipse at top left,rgba(86,90,225,.09),transparent 48%);}
-.hero{padding: 24px 0 18px;}
-.kicker{font-weight:800;letter-spacing:.16em;font-size:.72rem;color:#9695ff;}
-.hero h1{font-size:3.05rem;line-height:1.13;letter-spacing:-.055em;margin:12px 0 10px;}
-.hero p{font-size:1.03rem;color:#9397a7;max-width:760px;}
-.info{padding:16px 18px;border-radius:12px;background:rgba(120,125,140,.09);
-    border:1px solid rgba(130,135,150,.2);margin:12px 0;}
-.small{color:#9ba0b2;font-size:.85rem;}
+.block-container {max-width: 930px; padding-top: 1.75rem; padding-bottom: 4rem;}
+[data-testid="stApp"] {background: radial-gradient(ellipse at top left,rgba(94,82,255,.085),transparent 46%);}
+.kicker {font-size:.72rem;letter-spacing:.17em;font-weight:800;color:#a7a1ff;}
+.hero {padding:1.25rem 0 1.15rem;}
+.hero h1 {font-size:2.9rem;line-height:1.15;letter-spacing:-.055em;margin:.5rem 0;}
+.hero p {font-size:1rem;color:#9ca0b2;}
 </style>""", unsafe_allow_html=True)
 
 
-def get_secret(name: str) -> str:
+def secret(name: str) -> str:
     if os.environ.get(name):
         return os.environ[name]
     try:
-        return str(st.secrets.get(name, ""))
+        return str(st.secrets.get(name, "") or "")
     except Exception:
         return ""
 
 
-pwd = get_secret("APP_PASSWORD")
-api_key = get_secret("GEMINI_API_KEY")
-model = get_secret("GEMINI_MODEL") or "gemini-3.8-flash"
+def cache_key(*values: object) -> str:
+    hasher = hashlib.sha256()
+    for value in values:
+        part = value if isinstance(value, bytes) else str(value).encode("utf-8")
+        hasher.update(len(part).to_bytes(8, "big"))
+        hasher.update(part)
+    return hasher.hexdigest()
 
-if not pwd or len(pwd) < 12:
-    st.error("APP_PASSWORD missing or too short. Set a unique 12+ character password in Streamlit Cloud > App settings > Secrets.")
+
+def screenshot_contact_sheet(frames: list[bytes]) -> bytes:
+    """Use a small labelled 2-column collage as Gemini's screenshot fallback."""
+    from PIL import Image, ImageDraw
+    images = []
+    for blob in frames[:8]:
+        with Image.open(io.BytesIO(blob)) as im:
+            im = im.convert("RGB")
+            im.thumbnail((480, 270))
+            images.append(im.copy())
+    if not images:
+        return b""
+    canvas = Image.new("RGB", (960, ((len(images) + 1) // 2) * 290), "#15171f")
+    pen = ImageDraw.Draw(canvas)
+    for i, im in enumerate(images):
+        x = (i % 2) * 480
+        y = (i // 2) * 290
+        canvas.paste(im, (x, y + 18))
+        pen.text((x + 8, y + 2), f"Sampled frame {i + 1}", fill="#ffffff")
+    out = io.BytesIO()
+    canvas.save(out, "JPEG", quality=75)
+    return out.getvalue()
+
+
+password = secret("APP_PASSWORD")
+openai_key = secret("OPENAI_API_KEY")
+gemini_key = secret("GEMINI_API_KEY")
+openai_fast_model = secret("OPENAI_FAST_MODEL") or FAST_MODEL
+openai_verify_model = secret("OPENAI_VERIFY_MODEL") or VERIFY_MODEL
+gemini_model = secret("GEMINI_MODEL") or "gemini-2.5-flash"
+
+if len(password) < 12:
+    st.error("Set APP_PASSWORD (12+ characters) in Streamlit App settings → Secrets before continuing.")
     st.stop()
 
 if not st.session_state.get("authenticated"):
-    st.markdown('<div class="hero"><div class="kicker">PRIVATE RESEARCH WORKSPACE</div><h1>ReachLab<span style="color:#9a98ff">.</span></h1><p>Find the original episode behind a social clip.</p></div>', unsafe_allow_html=True)
-    st.text_input("Access password", type="password", key="input_password")
+    st.markdown('<div class="hero"><div class="kicker">PRIVATE RESEARCH WORKSPACE</div><h1>ReachLab<span style="color:#a8a5ff">.</span></h1><p>Find the original episode behind a short clip.</p></div>', unsafe_allow_html=True)
+    entry = st.text_input("Access password", type="password", key="access_password")
     if st.button("Unlock", type="primary", use_container_width=True):
-        fails = st.session_state.get("fails", 0)
-        if fails >= 8:
-            st.error("Too many attempts in this session. Restart your browser session later.")
-        elif hmac.compare_digest(st.session_state.input_password, pwd):
+        attempts = st.session_state.get("failed_logins", 0)
+        if attempts >= 8:
+            st.error("Too many attempts in this session. Try again later.")
+        elif hmac.compare_digest(entry, password):
             st.session_state.authenticated = True
             st.rerun()
         else:
-            st.session_state.fails = fails + 1
-            st.error("Incorrect password.")
+            st.session_state.failed_logins = attempts + 1
+            st.error("Incorrect password")
     st.stop()
 
-st.markdown('<div class="hero"><div class="kicker">CLOUD EPISODE RESEARCH ASSISTANT</div><h1>Find the scene. <span style="color:#a8a6ff">Find the episode.</span></h1><p>Paste a YouTube Short, Reel or Reddit link. Identify possible show, season, episode and gather editing notes—without pretending guesses are verified facts.</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="kicker">VIDEO & EPISODE RESEARCH</div><h1>Find the scene. <span style="color:#aaa4ff">Find the episode.</span></h1><p>Paste a public link, add a clip or screenshot, and investigate the original TV/cartoon episode with transparent evidence.</p></div>', unsafe_allow_html=True)
 
-if not api_key:
-    st.warning("Cloud AI key is not configured. Add GEMINI_API_KEY to Streamlit Secrets; do not put it in GitHub.")
+if not openai_key and not gemini_key:
+    st.error("No AI provider configured. Add OPENAI_API_KEY or GEMINI_API_KEY in Streamlit Secrets.")
+    st.stop()
 
 with st.sidebar:
     st.header("Research settings")
-    language = st.selectbox("Output language", ["English", "Roman Urdu", "Urdu"], index=1)
-    goal = st.selectbox("Goal", ["Identify the original TV/cartoon episode", "Summarize scene for a clipping channel", "Generate caption, hashtags and research notes"])
+    primary = st.radio("AI provider", ["OpenAI (fast)" , "Gemini" ] if openai_key and gemini_key else (["OpenAI (fast)"] if openai_key else ["Gemini"]), index=0)
+    use_fallback = st.checkbox("Automatically try Gemini if OpenAI fails", value=bool(gemini_key), disabled=not bool(gemini_key) or not bool(openai_key))
+    language = st.selectbox("Language", ["Roman Urdu", "English", "Urdu"])
+    goal = st.selectbox("Goal", ["Identify the original TV/cartoon episode", "Summarize scene for clipping channel", "Write captions and editing notes"])
+    catalog = st.checkbox("Check TVMaze episode listing", value=True)
     st.divider()
-    st.caption("Cloud provider: Gemini. Uses free quota where available; API usage and regional limits depend on your Google project.")
-    st.caption("Agent-Reach is a CLI toolkit, not an internet-facing API. This cloud MVP uses direct official video AI and optional public metadata extraction.")
-    st.caption("Copyright: Find the authorized source episode; check licensing before publishing third-party clips.")
+    st.caption("OpenAI requests, web search and optional transcription are usage-billed. Gemini fallback may also be billed. Use account spending limits.")
+    st.caption("Agent-Reach is not fully integrated. This MVP uses metadata, captions, uploaded video, and authorized AI APIs. No social-login cookies are stored.")
+    st.caption("Use clips legally; episode identification does not grant publishing rights.")
 
-url = st.text_input("Paste a public social link", placeholder="https://www.youtube.com/shorts/...")
-scene_notes = st.text_area("Optional scene description or dialogue", placeholder="Example: Peter and Stewie are talking about ...", max_chars=10000, height=110)
-shot = st.file_uploader("Optional screenshot of the scene (PNG/JPG, max 7 MB)", type=["png", "jpg", "jpeg"])
+url = st.text_input("YouTube Short / Instagram / Reddit link", placeholder="https://youtube.com/shorts/...")
+notes = st.text_area("Optional scene description or exact dialogue", placeholder="What happened? Any dialogue or character names?", max_chars=10000, height=90)
+known_season = st.number_input("Known season (optional clue, 0 = unknown)", min_value=0, max_value=100, value=0)
+img = st.file_uploader("Optional scene screenshot", type=["jpg", "jpeg", "png"], max_upload_size=7)
+video = st.file_uploader("Optional short video upload — MP4 / MOV / WEBM (max 45 MB)", type=["mp4", "mov", "webm", "m4v"], max_upload_size=45)
+want_transcript = st.checkbox("Transcribe uploaded video's spoken audio (separate API charge)", value=False, disabled=not bool(openai_key))
+st.caption("For link-only YouTube, ReachLab tries public captions + metadata. To analyze visuals reliably, upload the short video or a screenshot; a URL alone doesn't supply frames to OpenAI.")
 
-col1, col2 = st.columns(2)
-with col1:
-    analyze = st.button("Analyze & find episode", type="primary", use_container_width=True, disabled=not bool(api_key))
-with col2:
-    st.caption("YouTube: actual video analysis where API access allows. Other sites: notes, image and best-effort public metadata.")
+analyze = st.button("Analyze clip — Fast", type="primary", use_container_width=True)
 
 if analyze:
-    if time.monotonic() - st.session_state.get("last_run", -1e10) < 15:
-        st.warning("Please wait at least 15 seconds between requests.")
+    if time.monotonic() - st.session_state.get("last_started", -10**10) < 8:
+        st.warning("Please wait a few seconds between requests.")
         st.stop()
-    st.session_state.last_run = time.monotonic()
+    st.session_state.last_started = time.monotonic()
     try:
-        link = normalize_url(url) if url.strip() else None
+        clean_url = normalize_url(url) if url.strip() else None
     except ValueError as exc:
         st.error(str(exc))
         st.stop()
-    if not link and not scene_notes.strip() and not shot:
-        st.error("Please provide a link, scene description or screenshot.")
+    if not any([clean_url, notes.strip(), img, video]):
+        st.error("Add a link, scene notes, screenshot, or uploaded video.")
         st.stop()
-    shot_bytes, mime = None, None
-    if shot:
-        if shot.size > 7 * 1024 * 1024:
-            st.error("Screenshot is too large. Max 7 MB.")
-            st.stop()
-        shot_bytes = shot.getvalue()
-        mime = "image/png" if shot.type == "image/png" else "image/jpeg"
-
-    additional = scene_notes.strip()
-    if link and not ("youtube.com" in link or "youtu.be" in link):
-        try:
-            with st.spinner("Reading public post metadata (best effort)..."):
-                meta = public_media_metadata(link)
-            additional += ("\nPUBLIC METADATA (not video evidence):\n"
-                           + f"Title: {meta['title']}\nCreator: {meta['creator']}\nDescription: {meta['description']}")
-            st.info("Public post metadata found. The app has not watched Instagram/Reddit video; episode ID will be a hypothesis.")
-        except Exception:
-            st.info("Instagram/Reddit restricts this content from the cloud. Please add a screenshot or describe the scene.")
-    try:
-        with st.spinner("Analyzing evidence with Gemini..."):
-            result, evidence = gemini_analyze(api_key, model, link, additional, shot_bytes, mime, language, goal)
-    except Exception as exc:
-        st.error("Analysis failed: " + safe_string(exc, 500))
-        st.stop()
-
-    show = safe_string(result.get("show"), 130)
-    season, episode = result.get("season"), result.get("episode")
-    proposed_title = safe_string(result.get("episode_title"), 220)
-    with st.spinner("Cross-checking episode listing in TVMaze..."):
-        checked = tvmaze_verify(show, season, episode, proposed_title)
-
-    st.success("Research completed. Verify the clip source before publishing.")
-    st.subheader(show or "Show not confidently identified")
-    a, b, c = st.columns(3)
-    a.metric("Season", str(season or "Unknown"))
-    b.metric("Episode", str(episode or "Unknown"))
-    c.metric("AI confidence", safe_string(result.get("confidence"), 20).title() or "Unknown")
-    st.write("**Proposed episode title:** " + (proposed_title or "Unknown"))
-    st.write("**Evidence type:** " + evidence)
-    st.write("**Why this match:** " + safe_string(result.get("confidence_reason"), 1600))
-
-    if checked["status"] == "episode_listing_confirmed":
-        st.info(f"Episode catalog confirmed: **{checked['show']} — S{checked['season']}E{checked['episode']} — {checked['title']}**. This does **not** verify the clip originated from this episode.")
-        if checked.get("url"):
-            st.markdown("[View episode listing in TVMaze]({})".format(checked["url"]))
-        if checked.get("summary"):
-            with st.expander("TVMaze listed episode summary"):
-                st.write(checked["summary"])
+    image_data = img.getvalue() if img else None
+    image_mime = "image/png" if img and img.type == "image/png" else "image/jpeg"
+    video_data = video.getvalue() if video else None
+    key = cache_key(clean_url, notes, known_season, language, goal, primary, catalog,
+                    image_data or b"", video_data or b"", bool(want_transcript))
+    cached = st.session_state.get("analysis_cache", {})
+    if key in cached:
+        st.info("Loaded your previous analysis from this session (no new AI call).")
+        st.session_state["current_result"] = cached[key]
     else:
-        st.warning("Not independently verified: " + checked.get("reason", ""))
+        evidence = []
+        added_notes = notes.strip()
+        frames, extracted_audio = [], None
+        if video_data:
+            try:
+                with st.spinner("Sampling short video frames (local processing)..."):
+                    frames, extracted_audio = extract_video_frames_and_audio(
+                        video_data, video.name.rsplit(".", 1)[-1],
+                        want_audio=bool(want_transcript and openai_key))
+                evidence.append(f"{len(frames)} sampled video frames")
+            except Exception as exc:
+                st.error("Uploaded video could not be decoded: " + safe_string(exc, 250))
+                st.stop()
+        if extracted_audio and openai_key:
+            try:
+                with st.spinner("Transcribing spoken audio (extra API request)..."):
+                    transcript = transcribe_audio(openai_key, extracted_audio)
+                if transcript.strip():
+                    added_notes += "\nUPLOAD AUDIO TRANSCRIPT (machine-generated; may have errors):\n" + transcript
+                    evidence.append("audio transcript")
+            except Exception as exc:
+                st.warning("Audio transcription unavailable: " + safe_string(type(exc).__name__, 50) + ". Visual analysis will continue.")
+        if clean_url and not video_data:
+            # One public YouTube fetch for metadata + caption tracks; no video downloaded.
+            try:
+                with st.spinner("Reading available public captions and metadata..."):
+                    if is_youtube(clean_url):
+                        m, captions = youtube_public_evidence(clean_url)
+                    else:
+                        m, captions = public_media_metadata(clean_url), ""
+                if captions:
+                    added_notes += "\nYOUTUBE CAPTIONS (automatic captions may be inaccurate):\n" + captions
+                    evidence.append("public captions")
+                added_notes += ("\nPUBLIC METADATA (NOT scene verification):\n"
+                                + f"Title: {m['title']}\nCreator: {m['creator']}\n"
+                                + f"Description: {m['description'][:2400]}")
+                evidence.append("public metadata")
+            except Exception:
+                st.info("The platform did not provide public metadata; proceeding with uploaded evidence / notes if available.")
 
+        if not added_notes.strip() and not frames and not image_data and primary.startswith("OpenAI"):
+            st.error("OpenAI cannot identify the episode from an inaccessible URL alone. Please upload a scene screenshot/video or enter distinctive dialogue.")
+            st.stop()
+
+        result, evidence_label, used_provider = None, "", ""
+        err = None
+        if primary.startswith("OpenAI") and openai_key:
+            try:
+                with st.spinner("OpenAI analyzing scene evidence..."):
+                    result, evidence_label = analyze_openai(
+                        openai_key, openai_fast_model, clean_url, added_notes,
+                        language, goal, image_data, image_mime, frames,
+                        int(known_season) if known_season else None,
+                    )
+                used_provider = "OpenAI"
+            except Exception as exc:
+                err = exc
+                if not use_fallback or not gemini_key:
+                    st.error("OpenAI analysis failed: " + safe_string(exc, 420))
+                    st.stop()
+                st.warning("OpenAI temporarily unavailable. Trying Gemini fallback.")
+        if result is None and gemini_key:
+            try:
+                shot = screenshot_contact_sheet(frames) if frames else image_data
+                mime = "image/jpeg" if frames else image_mime
+                # For uploaded frames prefer attached scene evidence over remote URL handling.
+                fallback_url = None if frames else clean_url
+                with st.spinner("Analyzing with Gemini..."):
+                    result, evidence_label = gemini_analyze(
+                        gemini_key, gemini_model, fallback_url,
+                        added_notes, shot, mime, language, goal,
+                    )
+                used_provider = "Gemini" + (" fallback" if err else "")
+            except Exception as exc:
+                st.error("Gemini request failed: " + safe_string(exc, 400))
+                st.stop()
+        if result is None:
+            st.error("No AI provider produced a result.")
+            st.stop()
+        with st.spinner("Checking episode catalog (does not verify clip origin)..."):
+            listing = tvmaze_verify(safe_string(result.get("show"), 120), result.get("season"),
+                                    result.get("episode"), safe_string(result.get("episode_title"), 160)) if catalog else {
+                                        "status": "unverified", "reason": "Catalog lookup skipped to save time"}
+        match_status = episode_match_status(result, listing, int(known_season) if known_season else None)
+        payload = {"result": result, "listing": listing, "match_status": match_status,
+                   "evidence": evidence_label, "source_notes": added_notes, "url": clean_url or "",
+                   "provider": used_provider, "user_season": int(known_season) if known_season else None,
+                   "evidence_sources": evidence, "timestamp": time.time()}
+        st.session_state["current_result"] = payload
+        st.session_state.setdefault("analysis_cache", {})[key] = payload
+        # Cap session-memory usage and avoid persistent/cross-user caches.
+        while len(st.session_state.analysis_cache) > 8:
+            st.session_state.analysis_cache.pop(next(iter(st.session_state.analysis_cache)))
+        st.session_state.pop("deep_result", None)
+
+payload = st.session_state.get("current_result")
+if payload:
+    r = payload["result"]
+    listing = payload["listing"]
+    status = payload["match_status"]
+    st.divider()
+    st.subheader(safe_string(r.get("show"), 150) or "Show not identified")
+    st.warning(f"**{status['label']}** — {status['reason']}")
+    x, y, z = st.columns(3)
+    x.metric("Proposed season", safe_string(r.get("season"), 12) or "Unknown")
+    y.metric("Proposed episode", safe_string(r.get("episode"), 12) or "Unknown")
+    z.metric("AI confidence (not proof)", safe_string(r.get("confidence"), 20).title() or "Unknown")
+    st.write("**Proposed title (not confirmed from clip):** " + (safe_string(r.get("episode_title"), 250) or "Unknown"))
+    st.caption(f"AI provider: {payload['provider']} · Input: {payload['evidence']}")
+    st.write("**Scene evidence reason:** " + (safe_string(r.get("confidence_reason"), 1400) or "Not explained"))
+    if listing.get("status") == "episode_listing_confirmed":
+        st.info(f"Episode catalog confirms {listing['show']} S{listing['season']}E{listing['episode']} — {listing['title']} **exists**, NOT that this short comes from it.")
+        if listing.get("url"):
+            st.link_button("View episode listing", listing["url"])
+    else:
+        st.caption("TVMaze: " + safe_string(listing.get("reason"), 300))
     st.markdown("### Clip summary")
-    st.write(safe_string(result.get("clip_summary"), 4000) or "Insufficient evidence.")
-    if result.get("full_episode_context"):
-        st.markdown("### Possible episode context")
-        st.write(safe_string(result["full_episode_context"], 3000))
-    st.markdown("### Research & editing")
-    for heading, field in (("Characters", "characters"), ("Dialogue clues", "dialogue_clues"),
-                           ("Suggested searches", "search_queries"), ("Alternate matches", "alternative_matches")):
-        xs = result.get(field) or []
-        if isinstance(xs, list) and xs:
-            st.write(f"**{heading}:** " + "; ".join(safe_string(x, 300) for x in xs[:8]))
-    st.write("**Editing notes:** " + safe_string(result.get("creator_notes"), 2500))
-    st.write("**Caption idea:** " + safe_string(result.get("caption_idea"), 1200))
-    tags = result.get("hashtags") or []
+    st.write(safe_string(r.get("clip_summary"), 4200) or "Not enough scene evidence")
+    if r.get("full_episode_context"):
+        with st.expander("Possible episode context (hypothesis)"):
+            st.write(safe_string(r.get("full_episode_context"), 2800))
+    st.markdown("### Clues & creator notes")
+    for label, field in (("Characters", "characters"), ("Dialogue clues", "dialogue_clues"),
+                         ("Search queries", "search_queries"), ("Alternative matches", "alternative_matches")):
+        items = r.get(field) or []
+        if isinstance(items, list) and items:
+            st.write(f"**{label}:** " + "; ".join(safe_string(v, 320) for v in items[:8]))
+    st.write("**Editing notes:** " + safe_string(r.get("creator_notes"), 2200))
+    st.write("**Caption idea:** " + safe_string(r.get("caption_idea"), 1200))
+    tags = r.get("hashtags") or []
     if isinstance(tags, list):
-        st.write("**Hashtags:** " + " ".join(safe_string(v, 40) for v in tags[:12]))
-    st.caption("Limitations: " + safe_string(result.get("evidence_limitations"), 1400))
-    if show:
-        query = quote(f"{show} season {season or ''} episode {episode or ''} {proposed_title or ''}".strip())
-        st.link_button("Search episode on Google", "https://www.google.com/search?q=" + query)
-    report = format_download(result, checked, evidence, link or "")
+        st.write("**Hashtags:** " + " ".join(safe_string(t, 50) for t in tags[:12]))
+    st.caption("Limitations: " + safe_string(r.get("evidence_limitations"), 1200))
+
+    st.divider()
+    st.markdown("### Deep episode verification — optional")
+    st.caption("Search distinct dialogue and scene details online; uses a separate potentially paid API request. An episode listing alone never verifies the clip.")
+    if st.button("Search for matching scene evidence (extra API cost)", use_container_width=True):
+        if st.session_state.get("deep_result"):
+            st.info("Using previous deep research in this session.")
+        else:
+            try:
+                if openai_key:
+                    with st.spinner("Searching web for scene-specific episode evidence..."):
+                        deep = research_openai(openai_key, openai_verify_model,
+                                               r, payload["url"], payload["source_notes"], payload["user_season"])
+                elif gemini_key:
+                    with st.spinner("Searching web with Gemini..."):
+                        deep = grounded_web_research(gemini_key, gemini_model,
+                                                     r, payload["url"], payload["source_notes"])
+                else:
+                    raise RuntimeError("No provider for search")
+                st.session_state["deep_result"] = deep
+            except Exception as exc:
+                st.error("Web verification unavailable: " + safe_string(exc, 350))
+    if st.session_state.get("deep_result"):
+        deep = st.session_state.deep_result
+        st.markdown("#### Web research — candidate matches, not automatic proof")
+        st.write(deep.get("text") or "No explanation returned.")
+        if deep.get("sources"):
+            for source in deep["sources"]:
+                if source.get("url", "").startswith("https://"):
+                    st.link_button(safe_string(source.get("title"), 90) or "Read source", source["url"])
+        else:
+            st.info("No citation URLs returned. Treat candidate as unverified.")
+
+    st.link_button("Search exact episode on Google", "https://www.google.com/search?q=" + quote(
+        f"{r.get('show') or ''} season {r.get('season') or ''} episode {r.get('episode') or ''} {r.get('episode_title') or ''}"))
+    report = format_download(r, listing, payload["evidence"], payload["url"])
     st.download_button("Download research notes", report, "reachlab_episode_research.md", mime="text/markdown")
 
 st.divider()
-st.caption("ReachLab MVP · Hosted with Streamlit Community Cloud · Private app password · Source identification is best-effort")
+st.caption("ReachLab AI · Cloud Streamlit MVP · Scene IDs may be wrong; verify before clipping. Avoid sharing your API keys.")

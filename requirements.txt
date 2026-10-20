@@ -1,4 +1,6 @@
-streamlit>=1.40,<2
+streamlit>=1.54,<2
 requests>=2.32,<3
+openai>=1.40,<3
 google-genai>=1.55,<3
 yt-dlp>=2025.1.1
+imageio-ffmpeg>=0.5,<1

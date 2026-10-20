@@ -203,6 +203,72 @@ def gemini_analyze(api_key: str, model: str, url: str | None, description: str,
     return decode_json_response(txt), evidence
 
 
+
+def episode_match_status(result: dict, catalog_check: dict, known_season: int | None = None) -> dict:
+    """Fail closed: catalog listings never establish which episode a short came from.
+
+    A user's known season is a clue for review, not automatically verified truth.
+    """
+    season = optional_int(result.get("season"))
+    episode = optional_int(result.get("episode"))
+    known_season = optional_int(known_season)
+    if not season or not episode:
+        return {"label": "Not identified", "reason": "AI could not identify a season and episode.", "conflict": False}
+    if known_season and season != known_season:
+        return {"label": "Conflicting candidate", "reason": f"AI suggested Season {season}, but your known-season clue is Season {known_season}. The clip has not been matched to the episode.", "conflict": True}
+    if catalog_check.get("status") == "episode_listing_confirmed":
+        return {"label": "Unverified candidate", "reason": "The show/episode exists in TVMaze; this does not verify this particular scene or short is from it.", "conflict": False}
+    return {"label": "Unverified candidate", "reason": "The proposed episode was not cross-checked successfully against an episode catalog.", "conflict": False}
+
+
+def grounded_web_research(api_key: str, model: str, video_result: dict, source_link: str, notes: str) -> dict:
+    """Optional citation-backed episode research. Not proof of scene identity.
+
+    Video/visual analysis is a separate step. A web citation alone cannot verify a
+    video clip. Search is billed/separately quota-limited by the API provider.
+    """
+    from google import genai
+
+    show = safe_string(video_result.get("show"), 120)
+    clues = video_result.get("dialogue_clues") or []
+    if not isinstance(clues, list):
+        clues = []
+    summary = safe_string(video_result.get("clip_summary"), 1600)
+    if not (show or summary or notes.strip()):
+        raise ValueError("Insufficient scene evidence for a grounded search.")
+    prompt = (
+        "You are verifying the TV EPISODE ORIGIN of a SHORT video, not just confirming an episode exists. "
+        "Search the web for DISTINCTIVE dialogue, characters and scene events first. "
+        "Prioritize episode transcripts and scene-specific recaps. "
+        "Never use the presence of an episode in a guide as proof a clip belongs to it. "
+        "If no scene-level published evidence exists, say 'Unverified' and propose precise searches. "
+        "Label all matches hypotheses; cite evidence URLs for any strong claim. "
+        "Do not treat a YouTube clip uploader's hashtags as proof. "
+        f"SHOW: {show or 'Unknown'}\n"
+        f"AI VIDEO SCENE SUMMARY (unverified): {summary}\n"
+        f"DIALOGUE CLUES: {'; '.join(safe_string(c, 120) for c in clues[:5])}\n"
+        f"USER NOTES: {notes[:1800]}\n"
+        f"VIDEO SOURCE: {source_link[:400]}\n"
+        f"AI HYPOTHESIS (may be wrong): Season {video_result.get('season')}, "
+        f"Episode {video_result.get('episode')}, Title {video_result.get('episode_title')}\n"
+        "Respond concisely with: scene-specific evidence; alternate candidates; remaining uncertainties. "
+        "Never say verified based solely on catalog data."
+    )
+    client = genai.Client(api_key=api_key)
+    # Supported by the Gemini Interactions API for Gemini 3.8 Flash.
+    response = client.interactions.create(model=model, input=prompt, tools=[{"type": "google_search"}])
+    sources = []
+    for step in getattr(response, "steps", []) or []:
+        if getattr(step, "type", None) != "model_output":
+            continue
+        for content in getattr(step, "content", []) or []:
+            for ann in getattr(content, "annotations", []) or []:
+                if getattr(ann, "type", None) == "url_citation":
+                    url = str(getattr(ann, "url", "") or "")
+                    if url.startswith(("https://", "http://")) and url not in [item["url"] for item in sources]:
+                        sources.append({"title": safe_string(getattr(ann, "title", "Source"), 120), "url": url})
+    return {"text": safe_string(getattr(response, "output_text", ""), 9000), "sources": sources[:10]}
+
 def format_download(info: dict, verification: dict, evidence: str, url: str) -> str:
     lines = ["# ReachLab — Episode Research", f"Source: {url or 'pasted notes'}", f"Evidence: {evidence}", ""]
     for label, field in (("Show", "show"), ("Season", "season"), ("Episode", "episode"),
