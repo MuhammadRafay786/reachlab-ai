@@ -64,7 +64,7 @@ if st.button("Research with Agent-Reach + AI", type="primary"):
             st.warning("Guide unavailable: " + safe_string(exc, 200))
     try:
         with st.spinner("AI analyzing evidence..."):
-            result, ai_evidence = gemini_analyze(key, secret("GEMINI_MODEL") or "gemini-2.5-flash",
+            result, ai_evidence = gemini_analyze(key, secret("GEMINI_MODEL") or "gemini-3.8-flash",
                 link, evidence[:10000], None, None, language,
                 "Identify original show/episode without inventing episode numbers.")
     except Exception as exc:
