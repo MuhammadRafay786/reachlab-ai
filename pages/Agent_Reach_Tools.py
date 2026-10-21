@@ -27,9 +27,30 @@ if st.button("Check Agent-Reach channels"):
 
 url = st.text_input("Public YouTube Short or video URL")
 notes = st.text_area("Scene details / dialogue", max_chars=5000)
-guide = st.text_input("Optional episode guide (TVMaze / Wikipedia / Fandom / TheTVDB)")
+guide = st.text_input("Optional episode guide URL (leave blank unless you have a full https:// URL)", placeholder="https://www.tvmaze.com/episodes/...")
 use_captions = st.checkbox("Collect available YouTube captions with Agent-Reach", value=True)
+use_video = st.checkbox("Ask Gemini to analyze full YouTube video (slower)", value=False)
 language = st.selectbox("Response language", ["English", "Roman Urdu", "Urdu"], index=1)
+
+# Captions are useful even when OpenAI/Gemini API credits are exhausted.
+if st.button("Fetch captions only — no AI needed"):
+    try:
+        from reachlab import is_youtube
+        link = normalize_url(url)
+        if not is_youtube(link):
+            raise ValueError("Use a public YouTube video or Shorts URL.")
+        with st.spinner("Retrieving public captions..."):
+            transcript, src = read_youtube_captions(link)
+        st.session_state["reachlab_last_caption"] = (link, transcript, src)
+        st.success("Captions retrieved. No AI call was made.")
+    except Exception as exc:
+        st.warning("Caption extraction unavailable: " + safe_string(exc, 220))
+
+last = st.session_state.get("reachlab_last_caption")
+if last and url.strip() == last[0]:
+    with st.expander("Extracted captions — source evidence", expanded=True):
+        st.text_area("Captions (auto-generated transcripts may have errors)", last[1], height=210, disabled=True)
+        st.download_button("Download captions", last[1], file_name="reachlab_captions.txt", mime="text/plain")
 
 if st.button("Research with Agent-Reach + AI", type="primary"):
     key = secret("GEMINI_API_KEY")
@@ -47,11 +68,17 @@ if st.button("Research with Agent-Reach + AI", type="primary"):
     evidence, sources = notes.strip(), []
     if use_captions and link:
         try:
-            with st.spinner("Agent-Reach reading YouTube captions..."):
-                transcript, src = read_youtube_captions(link)
+            if last and link == last[0]:
+                transcript, src = last[1], last[2]
+            else:
+                with st.spinner("Agent-Reach reading YouTube captions..."):
+                    transcript, src = read_youtube_captions(link)
+                st.session_state["reachlab_last_caption"] = (link, transcript, src)
             evidence += "\nVIDEO CAPTIONS (untrusted source content):\n" + transcript
             sources.append(src)
-            st.success("Actual captions obtained.")
+            st.success("Actual captions obtained. Fast mode will analyze these captions.")
+            with st.expander("Captions fetched by Agent-Reach", expanded=False):
+                st.text_area("Transcript", transcript, height=180, disabled=True)
         except Exception as exc:
             st.warning("No captions available: " + safe_string(exc, 200))
     if guide.strip():
@@ -62,13 +89,20 @@ if st.button("Research with Agent-Reach + AI", type="primary"):
             sources.append("Agent-Reach WebChannel/Jina Reader")
         except Exception as exc:
             st.warning("Guide unavailable: " + safe_string(exc, 200))
+    if not evidence.strip() and not use_video:
+        st.warning("No accessible captions or scene notes. Provide dialogue/screenshot or turn on full video analysis.")
+        st.stop()
     try:
-        with st.spinner("AI analyzing evidence..."):
+        mode = "video (up to 35 seconds per request)" if use_video else "captions/text (up to 35 seconds per request)"
+        with st.spinner("Gemini analyzing " + mode + "..."):
             result, ai_evidence = gemini_analyze(key, secret("GEMINI_MODEL") or "gemini-3.8-flash",
-                link, evidence[:10000], None, None, language,
-                "Identify original show/episode without inventing episode numbers.")
+                link if use_video else None, evidence[:10000], None, None, language,
+                "Identify original show/episode without inventing episode numbers.",
+                prefer_text_evidence=not use_video)
     except Exception as exc:
-        st.error("AI failed: " + safe_string(exc, 300))
+        status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        st.error("AI unavailable: " + type(exc).__name__ + (f" (status {status})" if status else "")
+                 + ". Captions may still be available above. Check Gemini project/model quota and API access.")
         st.stop()
     show = safe_string(result.get("show"), 130)
     st.subheader(show or "Unknown show")
