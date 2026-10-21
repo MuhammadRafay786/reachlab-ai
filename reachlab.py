@@ -156,20 +156,25 @@ USER GOAL: {goal}
 
 def gemini_analyze(api_key: str, model: str, url: str | None, description: str,
                    screenshot: bytes | None, mime_type: str | None,
-                   language: str, goal: str) -> tuple[dict, str]:
-    """Video-first for public YouTube; fallback to provided notes and screenshot.
-    Returns (structured result, evidence label) or raises with no false success.
+                   language: str, goal: str,
+                   prefer_text_evidence: bool = False) -> tuple[dict, str]:
+    """Bounded Gemini request. Caption-first when provided; video is opt-in when evidence exists.
+
+    Caller must label transcript/metadata as untrusted and must not claim video
+    was seen when the caption-only mode is used.
     """
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    # Google GenAI HttpOptions.timeout is milliseconds; don't wait indefinitely
+    # on external YouTube video processing. Failing requests return a visible error.
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=35000))
     prompt = STRUCTURED_PROMPT.format(language=language, goal=goal[:500])
     details = f"Link: {url or 'none'}\nUser-provided context: {description[:MAX_INPUT]}\n"
     video_error = None
-    if url and is_youtube(url):
+    if url and is_youtube(url) and not prefer_text_evidence:
         try:
-            # Official Gemini Interactions API supports public YouTube URLs.
+            # Video processing can be slower than caption/text analysis.
             result = client.interactions.create(
                 model=model,
                 input=[
@@ -192,7 +197,8 @@ def gemini_analyze(api_key: str, model: str, url: str | None, description: str,
         )
     parts = [types.Part.from_text(text=prompt + "\n" + details +
                 "\nNo actual video frames were supplied unless an image is attached. Do not claim to have watched the clip.")]
-    evidence = "User-supplied scene notes"
+    evidence = ("Caption / text analysis (no video frames)" if prefer_text_evidence
+                else "User-supplied scene notes")
     if screenshot:
         parts.append(types.Part.from_bytes(data=screenshot, mime_type=mime_type or "image/jpeg"))
         evidence = "User-supplied screenshot and text"
