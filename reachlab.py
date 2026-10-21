@@ -189,6 +189,13 @@ def gemini_analyze(api_key: str, model: str, url: str | None, description: str,
         except Exception as exc:
             video_error = type(exc).__name__ + ": " + str(exc)[:300]
 
+    if video_error and not prefer_text_evidence:
+        # Do not silently make a second AI call after video processing fails.
+        # Cloud video errors need to be visible so users can retry with captions.
+        raise RuntimeError(
+            "Gemini could not complete video analysis. Try captions-only mode "
+            "or upload a short scene screenshot. Video error: " + video_error
+        )
     if not screenshot and not description.strip():
         # Do not pretend to analyze a clip from just a URL when video access failed.
         raise RuntimeError(
