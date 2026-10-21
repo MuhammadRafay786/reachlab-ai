@@ -238,6 +238,9 @@ if analyze:
                 if captions:
                     added_notes += "\nYOUTUBE CAPTIONS (automatic captions may be inaccurate):\n" + captions
                     evidence.append("public captions")
+                    st.session_state["reachlab_last_main_caption"] = (clean_url, captions)
+                    with st.expander("Public captions retrieved (usable even if AI fails)", expanded=False):
+                        st.text_area("Extracted transcript", captions, height=160, disabled=True)
                 added_notes += ("\nPUBLIC METADATA (NOT scene verification):\n"
                                 + f"Title: {m['title']}\nCreator: {m['creator']}\n"
                                 + f"Description: {m['description'][:2400]}")
@@ -280,6 +283,7 @@ if analyze:
                     result, evidence_label = gemini_analyze(
                         gemini_key, gemini_model, fallback_url,
                         added_notes, shot, mime, language, goal,
+                        prefer_text_evidence=bool(shot or "YOUTUBE CAPTIONS" in added_notes),
                     )
                 used_provider = "Gemini" + (" fallback" if err else "")
             except Exception as exc:
