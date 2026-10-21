@@ -113,6 +113,41 @@ with st.sidebar:
     st.caption("Agent-Reach is not fully integrated. This MVP uses metadata, captions, uploaded video, and authorized AI APIs. No social-login cookies are stored.")
     st.caption("Use clips legally; episode identification does not grant publishing rights.")
 
+# Explicit diagnostic: never show or log the actual API key.
+with st.sidebar:
+    st.divider()
+    if openai_key and st.button("Test OpenAI connection (small API charge)", use_container_width=True):
+        try:
+            from openai import OpenAI
+            test_client = OpenAI(api_key=openai_key, timeout=20.0, max_retries=0)
+            test_response = test_client.responses.create(
+                model=openai_fast_model, input="Reply with the word OK.",
+                max_output_tokens=16, store=False,
+            )
+            if (getattr(test_response, "output_text", "") or "").strip():
+                st.success(f"OpenAI connection works: {openai_fast_model}")
+            else:
+                st.warning("OpenAI request succeeded but returned no text. Check model response details.")
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            kind = type(exc).__name__
+            # Exception text can contain sensitive details; display only safe metadata.
+            st.error(f"OpenAI test failed: {kind}" + (f" (HTTP {status})" if status else ""))
+            if status == 401:
+                st.info("Check whether the OpenAI API key is valid and active.")
+            elif status == 429:
+                st.info("Check OpenAI API credits, quota and rate limits.")
+            elif status == 403:
+                st.info("Check project permissions and model access.")
+            elif status == 400:
+                st.info("Check OPENAI_FAST_MODEL and request compatibility.")
+            else:
+                st.info("Open Manage app → Logs to inspect the error category (never post keys).")
+    if st.button("Clear saved analysis and retry", use_container_width=True):
+        for field in ("analysis_cache", "current_result", "deep_result", "last_started"):
+            st.session_state.pop(field, None)
+        st.rerun()
+
 url = st.text_input("YouTube Short / Instagram / Reddit link", placeholder="https://youtube.com/shorts/...")
 notes = st.text_area("Optional scene description or exact dialogue", placeholder="What happened? Any dialogue or character names?", max_chars=10000, height=90)
 known_season = st.number_input("Known season (optional clue, 0 = unknown)", min_value=0, max_value=100, value=0)
@@ -139,7 +174,7 @@ if analyze:
     image_data = img.getvalue() if img else None
     image_mime = "image/png" if img and img.type == "image/png" else "image/jpeg"
     video_data = video.getvalue() if video else None
-    key = cache_key(clean_url, notes, known_season, language, goal, primary, catalog,
+    key = cache_key(clean_url, notes, known_season, language, goal, primary, openai_fast_model, gemini_model, catalog,
                     image_data or b"", video_data or b"", bool(want_transcript))
     cached = st.session_state.get("analysis_cache", {})
     if key in cached:
@@ -206,7 +241,11 @@ if analyze:
                 if not use_fallback or not gemini_key:
                     st.error("OpenAI analysis failed: " + safe_string(exc, 420))
                     st.stop()
-                st.warning("OpenAI temporarily unavailable. Trying Gemini fallback.")
+                st.warning(
+                    f"OpenAI failed: {type(exc).__name__}"
+                    + (f" (HTTP {getattr(exc, 'status_code')})" if getattr(exc, "status_code", None) else "")
+                    + ". Trying Gemini fallback. Use 'Test OpenAI connection' for diagnosis."
+                )
         if result is None and gemini_key:
             try:
                 shot = screenshot_contact_sheet(frames) if frames else image_data
@@ -235,7 +274,9 @@ if analyze:
                    "provider": used_provider, "user_season": int(known_season) if known_season else None,
                    "evidence_sources": evidence, "timestamp": time.time()}
         st.session_state["current_result"] = payload
-        st.session_state.setdefault("analysis_cache", {})[key] = payload
+        # Do not cache a Gemini fallback as an OpenAI success: it masks later fixes.
+        if used_provider != "Gemini fallback":
+            st.session_state.setdefault("analysis_cache", {})[key] = payload
         # Cap session-memory usage and avoid persistent/cross-user caches.
         while len(st.session_state.analysis_cache) > 8:
             st.session_state.analysis_cache.pop(next(iter(st.session_state.analysis_cache)))
