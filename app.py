@@ -275,8 +275,9 @@ if analyze:
                    "evidence_sources": evidence, "timestamp": time.time()}
         st.session_state["current_result"] = payload
         # Do not cache a Gemini fallback as an OpenAI success: it masks later fixes.
+        st.session_state.setdefault("analysis_cache", {})
         if used_provider != "Gemini fallback":
-            st.session_state.setdefault("analysis_cache", {})[key] = payload
+            st.session_state["analysis_cache"][key] = payload
         # Cap session-memory usage and avoid persistent/cross-user caches.
         while len(st.session_state.analysis_cache) > 8:
             st.session_state.analysis_cache.pop(next(iter(st.session_state.analysis_cache)))
