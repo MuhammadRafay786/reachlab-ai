@@ -74,7 +74,7 @@ openai_key = secret("OPENAI_API_KEY")
 gemini_key = secret("GEMINI_API_KEY")
 openai_fast_model = secret("OPENAI_FAST_MODEL") or FAST_MODEL
 openai_verify_model = secret("OPENAI_VERIFY_MODEL") or VERIFY_MODEL
-gemini_model = secret("GEMINI_MODEL") or "gemini-2.5-flash"
+gemini_model = secret("GEMINI_MODEL") or "gemini-3.8-flash"
 
 if len(password) < 12:
     st.error("Set APP_PASSWORD (12+ characters) in Streamlit App settings → Secrets before continuing.")
@@ -143,6 +143,30 @@ with st.sidebar:
                 st.info("Check OPENAI_FAST_MODEL and request compatibility.")
             else:
                 st.info("Open Manage app → Logs to inspect the error category (never post keys).")
+    if gemini_key and st.button("Test Gemini connection (small API charge)", use_container_width=True):
+        try:
+            from google import genai
+            gemini_client = genai.Client(api_key=gemini_key)
+            gemini_test = gemini_client.models.generate_content(
+                model=gemini_model, contents="Respond with the word OK."
+            )
+            if (getattr(gemini_test, "text", "") or "").strip():
+                st.success(f"Gemini connection works: {gemini_model}")
+            else:
+                st.warning("Gemini returned no text. Check model access or safety filtering.")
+        except Exception as exc:
+            status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            st.error(f"Gemini test failed: {type(exc).__name__}" + (f" (status {status})" if status is not None else ""))
+            st.info("Check GEMINI_MODEL, API project/model access, quota and billing. The API key is not displayed.")
+    if st.button("Check Agent-Reach channels", use_container_width=True):
+        try:
+            from agentreach_cloud import check_channels
+            channel_status = check_channels()
+            for channel, (health, backend, _description) in channel_status.items():
+                st.write(f"{channel}: {health} (backend: {backend})")
+            st.caption("Status checks tools only; they do not generate an AI answer.")
+        except Exception as exc:
+            st.error(f"Agent-Reach check failed: {type(exc).__name__} (see private Streamlit logs)")
     if st.button("Clear saved analysis and retry", use_container_width=True):
         for field in ("analysis_cache", "current_result", "deep_result", "last_started"):
             st.session_state.pop(field, None)
